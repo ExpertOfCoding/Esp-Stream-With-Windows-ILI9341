@@ -20,9 +20,6 @@ Kurulması gerekenler:
 * Preferences
 * JPEGDEC
 * WiFi
-
-Arduino Library Manager üzerinden kurulabilir.
-
 ---
 
 # TFT_eSPI Ayarı
