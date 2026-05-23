@@ -1,712 +1,375 @@
-/*  
-    ESP32 Smooth Video Stream Client (Fixed: Watchdog Error & Optimized)
-    NOTES: NetworkTas 1 Works perfect
-    esp should stay close to wifi otherwise it seems laggy
-    screen stream optimised
-*/
-
-#include <SPI.h>
-#include <FS.h>
-#include <TFT_eSPI.h>
-#include <WiFi.h>
-#include <XPT2046_Touchscreen.h>
-#include <Preferences.h>
-#include <JPEGDEC.h>
-#include <esp_task_wdt.h>  // Watchdog kütüphanesi eklendi
-
-TFT_eSPI tft = TFT_eSPI();
-Preferences preferences;
-JPEGDEC jpeg;
-
-// --- PIN TANIMLARI ---
-#define buzzerPin 26
-
-#define XPT2046_IRQ 36
-#define XPT2046_MOSI 32
-#define XPT2046_MISO 39
-#define XPT2046_CLK 25
-#define XPT2046_CS 33
-
-SPIClass touchscreenSPI = SPIClass(VSPI);
-XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
-
-#define SCREEN_WIDTH 320
-#define SCREEN_HEIGHT 240
-#define FONT_SIZE 2
-
-// Dokunmatik Kalibrasyon
-#define TS_MINX 200
-#define TS_MAXX 3700
-#define TS_MINY 240
-#define TS_MAXY 3800
-
-#define CLIENT_TIMEOUT 1500
-int pwmFreq = 2000;
-int pwmRes = 8;
-
-// --- GLOBAL DEĞİŞKENLER & BUFFER ---
-unsigned long timeDelay = 0;
-bool scan_wifi = true;
-bool isStarted = false;
-String targetIP = "";
-
-int selectedMode = 0;  // 0: Seçilmedi, 1: SCREEN, 2: STREAM
-
-// --- MULTI-THREADING YAPISI ---
-TaskHandle_t Task1;
-QueueHandle_t emptyQueue;
-QueueHandle_t filledQueue;
-
-struct JpgFrame {
-  uint8_t* buffer;
-  size_t len;
-};
-
-#define MAX_JPG_SIZE 50000
-
-uint8_t* bufA;
-uint8_t* bufB;
-
-// --- KLAVYE & NUMPAD ---
-const char mobile_keyboard[4][11] = {
-  { '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 0 },
-  { 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', 0 },
-  { 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0, 0 },
-  { '^', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '.', 0, 0 }
-};
-
-const char numpad_keys[4][3] = {
-  { '1', '2', '3' },
-  { '4', '5', '6' },
-  { '7', '8', '9' },
-  { '.', '0', ':' }
-};
-
-// --- YARDIMCI FONKSİYONLAR ---
-String ssidToKey(String ssid) {
-  unsigned long hash = 5381;
-  for (int i = 0; i < ssid.length(); i++) {
-    hash = ((hash << 5) + hash) + ssid.charAt(i);
-  }
-  return String(hash, HEX);
-}
-
-void typeWriterPrint(String text, int centerX, int y, int fontIndex) {
-  int randomDuty = random(1, 256);
-  tft.setTextFont(fontIndex);
-  int textWidth = tft.textWidth(text);
-  int startX = centerX - (textWidth / 2);
-  tft.setCursor(startX, y);
-
-  for (int i = 0; i < text.length(); i++) {
-    tft.print(text[i]);
-    ledcWrite(buzzerPin, randomDuty);
-    delay(10);
-    ledcWrite(buzzerPin, 0);
-    delay(35);
-  }
-}
-
-void printWifiInfo(String ssid, String rssi, String encryption) {
-  tft.fillScreen(TFT_WHITE);
-  tft.setTextColor(TFT_BLACK, TFT_WHITE);
-  int centerX = SCREEN_WIDTH / 2;
-  typeWriterPrint("Agi Secmek Icin Dokun", centerX, 20, 2);
-  tft.fillRect(20, 60, 280, 120, TFT_LIGHTGREY);
-  tft.drawRect(20, 60, 280, 120, TFT_BLACK);
-  tft.setTextColor(TFT_BLUE, TFT_LIGHTGREY);
-  typeWriterPrint(ssid, centerX, 80, 2);
-  tft.setTextColor(TFT_BLACK, TFT_LIGHTGREY);
-  typeWriterPrint("Sinyal:" + rssi + " dBm", centerX, 110, 2);
-  typeWriterPrint(encryption, centerX, 140, 2);
-}
-
-int JPEGDraw(JPEGDRAW* pDraw) {
-  tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
-  return 1;
-}
-
-// --- ARAYÜZ FONKSİYONLARI ---
-void drawKeyboard(bool isShift) {
-  int keyW = 32;
-  int keyH = 40;
-  int startY = 80;
-  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-  tft.setTextSize(1);
-  for (int r = 0; r < 4; r++) {
-    for (int c = 0; c < 10; c++) {
-      char k = mobile_keyboard[r][c];
-      if (k != 0) {
-        int xPos = c * keyW + 1;
-        int yPos = startY + r * keyH + 1;
-        tft.fillRect(xPos, yPos, keyW - 2, keyH - 2, TFT_DARKGREY);
-        tft.drawRect(xPos, yPos, keyW - 2, keyH - 2, TFT_BLACK);
-        char displayChar = k;
-        if (!isShift && k >= 'A' && k <= 'Z') displayChar = k + 32;
-        if (k == '^') {
-          if (isShift) {
-            tft.fillRect(xPos, yPos, keyW - 2, keyH - 2, TFT_ORANGE);
-            tft.setTextColor(TFT_BLACK, TFT_ORANGE);
-          } else {
-            tft.setTextColor(TFT_YELLOW, TFT_DARKGREY);
-          }
-          tft.drawString("SHIFT", xPos + 2, yPos + 12, 1);
-          tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-        } else {
-          tft.drawChar(displayChar, xPos + 10, yPos + 10, 2);
-        }
-      }
-    }
-  }
-  int delX = 9 * keyW + 1;
-  int delY = startY + 2 * keyH + 1;
-  tft.fillRect(delX, delY, keyW - 2, keyH - 2, TFT_RED);
-  tft.setTextColor(TFT_WHITE, TFT_RED);
-  tft.drawString("DEL", delX + 5, delY + 12, 1);
-  int okX = 9 * keyW + 1;
-  int okY = startY + 3 * keyH + 1;
-  tft.fillRect(okX, okY, keyW - 2, keyH - 2, TFT_GREEN);
-  tft.setTextColor(TFT_BLACK, TFT_GREEN);
-  tft.drawString("OK", okX + 8, okY + 10, 2);
-}
-
-String getPasswordFromKeyboard(String ssidName, String savedPassword) {
-  String pass = savedPassword;
-  bool isShift = false;
-  bool finish = false;
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  typeWriterPrint("Sifre:" + ssidName, 5, 5, 1);
-  tft.drawRect(0, 40, 320, 30, TFT_WHITE);
-  drawKeyboard(isShift);
-  int keyW = 32;
-  int keyH = 40;
-  int startY = 80;
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  typeWriterPrint(pass, 5, 47, 2);
-
-  while (!finish) {
-    tft.fillRect(2, 42, 316, 26, TFT_BLACK);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(pass, 5, 47, 2);
-    while (!touchscreen.tirqTouched()) { delay(10); }
-    if (touchscreen.touched()) {
-      TS_Point p = touchscreen.getPoint();
-      int touch_x = map(p.x, TS_MINX, TS_MAXX, 0, SCREEN_WIDTH);
-      int touch_y = map(p.y, TS_MINY, TS_MAXY, 0, SCREEN_HEIGHT);
-      delay(150);
-      while (touchscreen.touched()) {};
-      if (touch_y > startY) {
-        int r = (touch_y - startY) / keyH;
-        int c = touch_x / keyW;
-        if (r >= 0 && r < 4 && c >= 0 && c < 10) {
-          ledcWrite(buzzerPin, 128);
-          delay(10);
-          ledcWrite(buzzerPin, 0);
-          if (r == 2 && c == 9) {
-            if (pass.length() > 0) pass.remove(pass.length() - 1);
-          } else if (r == 3 && c == 9) {
-            finish = true;
-            ledcWrite(buzzerPin, 255);
-            delay(20);
-            ledcWrite(buzzerPin, 0);
-          } else if (r == 3 && c == 0) {
-            isShift = !isShift;
-            drawKeyboard(isShift);
-          } else {
-            char k = mobile_keyboard[r][c];
-            if (k != 0 && k != '^') {
-              if (!isShift && k >= 'A' && k <= 'Z') pass += (char)(k + 32);
-              else pass += k;
-            }
-          }
-        }
-      }
-    }
-  }
-  return pass;
-}
-
-void drawNumpad() {
-  int btnW = 60;
-  int btnH = 38;
-  int startX = 30;
-  int startY = 65;
-  int gap = 8;
-  tft.setTextSize(2);
-  for (int r = 0; r < 4; r++) {
-    for (int c = 0; c < 3; c++) {
-      char k = numpad_keys[r][c];
-      int xPos = startX + (c * btnW);
-      int yPos = startY + (r * btnH);
-      tft.fillRect(xPos + 2, yPos + 2, btnW - 4, btnH - 4, TFT_DARKGREY);
-      tft.drawRect(xPos + 2, yPos + 2, btnW - 4, btnH - 4, TFT_WHITE);
-      tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-      tft.drawChar(k, xPos + (btnW / 2) - 5, yPos + (btnH / 2) - 7, 1);
-    }
-  }
-  int ctrlX = startX + (3 * btnW) + gap;
-  int ctrlW = 65;
-  int totalH = 4 * btnH;
-  tft.fillRect(ctrlX, startY + 2, ctrlW, (totalH / 2) - 4, TFT_RED);
-  tft.drawRect(ctrlX, startY + 2, ctrlW, (totalH / 2) - 4, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE, TFT_RED);
-  tft.drawString("SIL", ctrlX + 15, startY + (totalH / 4) - 8, 1);
-  tft.fillRect(ctrlX, startY + (totalH / 2) + 2, ctrlW, (totalH / 2) - 4, TFT_GREEN);
-  tft.drawRect(ctrlX, startY + (totalH / 2) + 2, ctrlW, (totalH / 2) - 4, TFT_WHITE);
-  tft.setTextColor(TFT_BLACK, TFT_GREEN);
-  tft.drawString("OK", ctrlX + 20, startY + (totalH * 0.75) - 8, 1);
-}
-
-String getIPPortFromNumpad(String savedIP) {
-  String currentInput = savedIP;
-  bool finished = false;
-  int btnW = 60;
-  int btnH = 38;
-  int startX = 30;
-  int startY = 65;
-  int gap = 8;
-  int ctrlX = startX + (3 * btnW) + gap;
-  int ctrlW = 65;
-  int totalH = 4 * btnH;
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  typeWriterPrint("IP ve Port Girin", SCREEN_WIDTH / 2, 2, 2);
-  tft.drawRect(30, 25, 260, 30, TFT_WHITE);
-  drawNumpad();
-  bool updateScreen = true;
-  while (!finished) {
-    if (updateScreen) {
-      tft.fillRect(31, 26, 258, 28, TFT_BLACK);
-      String textToDisplay = currentInput;
-      int maxPixelWidth = 250;
-      while (tft.textWidth(textToDisplay) > maxPixelWidth) { textToDisplay = textToDisplay.substring(1); }
-      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-      tft.drawString(textToDisplay, 35, 32, 1);
-      updateScreen = false;
-    }
-    if (touchscreen.tirqTouched() && touchscreen.touched()) {
-      TS_Point p = touchscreen.getPoint();
-      int t_x = map(p.x, TS_MINX, TS_MAXX, 0, SCREEN_WIDTH);
-      int t_y = map(p.y, TS_MINY, TS_MAXY, 0, SCREEN_HEIGHT);
-      delay(200);
-      while (touchscreen.touched())
-        ;
-      if (t_x >= startX && t_x < ctrlX && t_y >= startY && t_y < startY + totalH) {
-        ledcWrite(buzzerPin, 128);
-        delay(10);
-        ledcWrite(buzzerPin, 0);
-        int r = (t_y - startY) / btnH;
-        int c = (t_x - startX) / btnW;
-        if (r >= 0 && r < 4 && c >= 0 && c < 3) {
-          char k = numpad_keys[r][c];
-          currentInput += k;
-          updateScreen = true;
-        }
-      } else if (t_x >= ctrlX && t_x <= ctrlX + ctrlW) {
-        if (t_y >= startY && t_y < startY + (totalH / 2)) {
-          if (currentInput.length() > 0) {
-            ledcWrite(buzzerPin, 255);
-            delay(10);
-            ledcWrite(buzzerPin, 0);
-            currentInput.remove(currentInput.length() - 1);
-            updateScreen = true;
-          }
-        } else if (t_y >= startY + (totalH / 2) && t_y < startY + totalH) {
-          finished = true;
-          ledcWrite(buzzerPin, 255);
-          delay(20);
-          ledcWrite(buzzerPin, 0);
-        }
-      }
-    }
-  }
-  return currentInput;
-}
-
-void drawModeButtons() {
-  tft.fillScreen(TFT_BLACK);
-
-  // Başlık
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawCentreString("MOD SECIMI", SCREEN_WIDTH / 2, 20, 2);
-
-  // SCREEN Butonu (Sol - Mavi)
-  tft.fillRect(20, 70, 130, 100, TFT_BLUE);
-  tft.drawRect(20, 70, 130, 100, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE, TFT_BLUE);
-  tft.drawCentreString("SCREEN", 85, 110, 2);
-
-  // STREAM Butonu (Sağ - Turuncu)
-  tft.fillRect(170, 70, 130, 100, TFT_ORANGE);
-  tft.drawRect(170, 70, 130, 100, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE, TFT_ORANGE);
-  tft.drawCentreString("STREAM", 235, 110, 2);
-}
-
-
-void NetworkTaskCode2(void* parameter) {
-  WiFiClient localClient;
-  String ipStr;
-  int port;
-  int colonIndex = targetIP.indexOf(':');
-  ipStr = targetIP.substring(0, colonIndex);
-  port = targetIP.substring(colonIndex + 1).toInt();
-  while (true) {
-    if (!localClient.connected()) {
-      if (!localClient.connect(ipStr.c_str(), port)) {
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-        continue;
-      }
-      localClient.setNoDelay(true);
-    }
-    if (localClient.available() < 4) {
-      vTaskDelay(1 / portTICK_PERIOD_MS);
-      continue;
-    }
-
-    uint8_t sizeBuffer[4];
-    if (localClient.readBytes(sizeBuffer, 4) != 4) continue;
-    uint32_t jpgSize = (sizeBuffer[0] << 24) | (sizeBuffer[1] << 16) | (sizeBuffer[2] << 8) | sizeBuffer[3];
-
-    if (jpgSize > MAX_JPG_SIZE || jpgSize == 0) {
-      while (localClient.available()) localClient.read();
-      localClient.stop();
-      continue;
-    }
-
-    uint8_t* ptr = NULL;
-    if (xQueueReceive(emptyQueue, &ptr, portMAX_DELAY) == pdPASS) {
-
-      size_t readLen = 0;
-      unsigned long startRead = millis();
-      bool error = false;
-
-      while (readLen < jpgSize) {
-        if (localClient.available()) {
-          int r = localClient.read(ptr + readLen, jpgSize - readLen);
-          if (r > 0) {
-            readLen += r;
-            startRead = millis();
-          }
-        }
-        if (millis() - startRead > CLIENT_TIMEOUT) {
-          localClient.stop();
-          error = true;
-          break;
-        }
-      }
-
-      if (!error) {
-        JpgFrame frame;
-        frame.buffer = ptr;
-        frame.len = jpgSize;
-        xQueueSend(filledQueue, &frame, portMAX_DELAY);
-      } else {
-        xQueueSend(emptyQueue, &ptr, portMAX_DELAY);
-      }
-    }
-  }
-}
-
-// ====================================================================================
-// PERFORMANS ODAKLI NETWORK GÖREVİ (Smart Yielding)
-// ====================================================================================
-void NetworkTaskCode(void* parameter) {
-  WiFiClient localClient;
-  String ipStr;
-  int port;
-
-  int colonIndex = targetIP.indexOf(':');
-  ipStr = targetIP.substring(0, colonIndex);
-  port = targetIP.substring(colonIndex + 1).toInt();
-
-  // Watchdog için zaman sayacı
-  unsigned long lastYieldTime = 0;
-
-  while (true) {
-    if (!localClient.connected()) {
-      if (!localClient.connect(ipStr.c_str(), port)) {
-        // Bağlı değilken beklemesinde sakınca yok
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-        continue;
-      }
-      localClient.setNoDelay(true);
-    }
-
-    // --- KRİTİK NOKTA 1: VERİ BEKLEME ---
-    // Eğer hiç veri yoksa işlemciyi yorma, 1ms bekle.
-    // Bu sadece akış kesildiğinde devreye girer, akış varken çalışmaz.
-    if (localClient.available() < 4) {
-      // Sadece çok uzun süre veri gelmezse bekle (Smart Yield)
-      if (millis() - lastYieldTime > 10) {
-        vTaskDelay(1);
-        lastYieldTime = millis();
-      }
-      continue;
-    }
-
-    uint8_t sizeBuffer[4];
-    if (localClient.readBytes(sizeBuffer, 4) != 4) continue;
-    uint32_t jpgSize = (sizeBuffer[0] << 24) | (sizeBuffer[1] << 16) | (sizeBuffer[2] << 8) | sizeBuffer[3];
-
-    if (jpgSize > MAX_JPG_SIZE || jpgSize == 0) {
-      while (localClient.available()) localClient.read();
-      localClient.stop();
-      continue;
-    }
-
-    uint8_t* ptr = NULL;
-    if (xQueueReceive(emptyQueue, &ptr, portMAX_DELAY) == pdPASS) {
-
-      size_t readLen = 0;
-      unsigned long startRead = millis();
-      bool error = false;
-
-      while (readLen < jpgSize) {
-        int avail = localClient.available();
-
-        if (avail > 0) {
-          int bytesToRead = jpgSize - readLen;
-          if (bytesToRead > avail) bytesToRead = avail;
-
-          // Veriyi son sürat oku
-          int r = localClient.read(ptr + readLen, bytesToRead);
-          if (r > 0) {
-            readLen += r;
-            startRead = millis();
-          }
-        }
-
-        // --- KRİTİK NOKTA 2: SMART YIELD ---
-        // Her seferinde değil, sadece 20ms'de bir 1ms mola ver.
-        // Bu, Watchdog'u (5 saniye süresi var) resetlemek için fazlasıyla yeterli
-        // ama görüntüyü dondurmayacak kadar kısadır.
-        if (millis() - lastYieldTime > 20) {
-          vTaskDelay(1);  // İşletim sistemine "Ben buradayım" de
-          lastYieldTime = millis();
-        }
-
-        // Timeout kontrolü
-        if (millis() - startRead > CLIENT_TIMEOUT) {
-          localClient.stop();
-          error = true;
-          break;
-        }
-      }
-
-      if (!error) {
-        JpgFrame frame;
-        frame.buffer = ptr;
-        frame.len = jpgSize;
-        xQueueSend(filledQueue, &frame, portMAX_DELAY);
-      } else {
-        xQueueSend(emptyQueue, &ptr, portMAX_DELAY);
-      }
-    }
-  }
-}
-// -------------------------------------------------------------------------
-// SETUP
-// -------------------------------------------------------------------------
-void setup() {
-  Serial.begin(115200);
-  ledcAttach(buzzerPin, pwmFreq, pwmRes);
-
-  preferences.begin("wifi_db", false);
-
-  if (psramFound()) {
-    Serial.println("PSRAM bulundu, buffer PSRAM'e kuruluyor...");
-    bufA = (uint8_t*)ps_malloc(MAX_JPG_SIZE);
-    bufB = (uint8_t*)ps_malloc(MAX_JPG_SIZE);
-  } else {
-    Serial.println("PSRAM yok, standart RAM kullaniliyor...");
-    bufA = (uint8_t*)malloc(MAX_JPG_SIZE);
-    bufB = (uint8_t*)malloc(MAX_JPG_SIZE);
-  }
-
-  if (bufA == NULL || bufB == NULL) {
-    Serial.printf("Yetersiz bellek! Gereken: %d byte. Mevcut Free Heap: %d\n", MAX_JPG_SIZE * 2, ESP.getFreeHeap());
-    while (1) { delay(1000); }
-  }
-
-  emptyQueue = xQueueCreate(2, sizeof(uint8_t*));
-  filledQueue = xQueueCreate(2, sizeof(JpgFrame));
-
-  xQueueSend(emptyQueue, &bufA, portMAX_DELAY);
-  xQueueSend(emptyQueue, &bufB, portMAX_DELAY);
-
-  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-  touchscreen.begin(touchscreenSPI);
-  touchscreen.setRotation(1);
-
-  tft.init();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_WHITE);
-  tft.setSwapBytes(true);
-  tft.initDMA();
-  tft.setTextColor(TFT_BLACK, TFT_WHITE);
-
-  int centerX = SCREEN_WIDTH / 2;
-  typeWriterPrint("Sistem Baslatiliyor...", centerX, 100, FONT_SIZE);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(1000);
-}
-
-// -------------------------------------------------------------------------
-// LOOP (MAIN THREAD - CORE 1: EKRAN ÇİZİM)
-// -------------------------------------------------------------------------
-void loop() {
-  // AŞAMA 1: Wİ-Fİ AYARLARI (Arayüz)
-  if (scan_wifi) {
-    scan_wifi = false;
-    tft.fillScreen(TFT_WHITE);
-    tft.setTextColor(TFT_BLACK);
-    typeWriterPrint("Wi-Fi Taraniyor...", SCREEN_WIDTH / 2, 110, 2);
-
-    int n = WiFi.scanNetworks();
-    if (n == 0) {
-      tft.fillScreen(TFT_WHITE);
-      typeWriterPrint("Ag Bulunamadi!", SCREEN_WIDTH / 2, 110, 2);
-      delay(2000);
-      scan_wifi = true;
-    } else {
-      bool agSecildi = false;
-      for (int i = 0; i < n; ++i) {
-        String currentSSID = WiFi.SSID(i);
-        String encType = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "ACIK" : "SIFRELI";
-        printWifiInfo(currentSSID, String(WiFi.RSSI(i)), encType);
-        unsigned long startWait = millis();
-        while (millis() - startWait < 3000) {
-          int progress = map(millis() - startWait, 0, 3000, 0, 320);
-          tft.drawFastHLine(0, 230, progress, TFT_RED);
-          if (touchscreen.tirqTouched() && touchscreen.touched()) {
-            agSecildi = true;
-            while (touchscreen.touched())
-              ;
-            String password = "";
-            String key = ssidToKey(currentSSID);
-            String savedPass = preferences.getString(key.c_str(), "");
-            if (encType != "ACIK" && savedPass == "") password = getPasswordFromKeyboard(currentSSID, savedPass);
-            tft.fillScreen(TFT_BLACK);
-            tft.setTextColor(TFT_WHITE);
-            typeWriterPrint("Baglaniyor...", SCREEN_WIDTH / 2, 100, 2);
-            typeWriterPrint(currentSSID, SCREEN_WIDTH / 2, 130, 2);
-            if (savedPass != "") WiFi.begin(currentSSID.c_str(), savedPass.c_str());
-            else WiFi.begin(currentSSID.c_str(), password.c_str());
-            int timeout = 0;
-            while (WiFi.status() != WL_CONNECTED && timeout < 20) {
-              delay(500);
-              timeout++;
-            }
-            if (WiFi.status() == WL_CONNECTED) {
-              if (encType != "ACIK" && savedPass == "") preferences.putString(key.c_str(), password);
-              tft.fillScreen(TFT_GREEN);
-              tft.setTextColor(TFT_BLACK);
-              typeWriterPrint("Wi-Fi BAGLANDI!", SCREEN_WIDTH / 2, 100, 2);
-              delay(1000);
-              i = n;
-            } else {
-              preferences.remove(key.c_str());
-              tft.fillScreen(TFT_RED);
-              tft.setTextColor(TFT_WHITE);
-              typeWriterPrint("SIFRE HATALI - SILINDI", SCREEN_WIDTH / 2, 110, 2);
-              delay(2000);
-              scan_wifi = true;
-            }
-            break;
-          }
-        }
-        if (agSecildi) break;
-      }
-      if (!agSecildi && WiFi.status() != WL_CONNECTED) scan_wifi = true;
-    }
-  }
-
-  // AŞAMA 2: BAĞLANTI SONRASI & STREAM BAŞLATMA
-  if (WiFi.status() == WL_CONNECTED) {
-
-    // 2.1: MOD SEÇİMİ (HENÜZ SEÇİLMEDİYSE)
-    if (selectedMode == 0) {
-      drawModeButtons();
-      bool modeSelected = false;
-      while (!modeSelected) {
-        if (touchscreen.tirqTouched() && touchscreen.touched()) {
-          TS_Point p = touchscreen.getPoint();
-          int t_x = map(p.x, TS_MINX, TS_MAXX, 0, SCREEN_WIDTH);
-          int t_y = map(p.y, TS_MINY, TS_MAXY, 0, SCREEN_HEIGHT);
-
-          delay(150);  // Debounce
-          while (touchscreen.touched())
-            ;  // Parmağın çekilmesini bekle
-
-          // SCREEN Butonu Koordinatları (20,70) - (150, 170)
-          if (t_x >= 20 && t_x <= 150 && t_y >= 70 && t_y <= 170) {
-            selectedMode = 1;  // SCREEN
-            ledcWrite(buzzerPin, 200);
-            delay(50);
-            ledcWrite(buzzerPin, 0);
-            modeSelected = true;
-          }
-          // STREAM Butonu Koordinatları (170,70) - (300, 170)
-          else if (t_x >= 170 && t_x <= 300 && t_y >= 70 && t_y <= 170) {
-            selectedMode = 2;  // STREAM
-            ledcWrite(buzzerPin, 200);
-            delay(50);
-            ledcWrite(buzzerPin, 0);
-            modeSelected = true;
-          }
-        }
-      }
-    }
-
-    // 2.2: IP GİRİŞİ VE GÖREV BAŞLATMA
-    else if (!isStarted) {
-      String savedIP = preferences.getString("target_ip", "");
-      targetIP = getIPPortFromNumpad(savedIP);
-      if (targetIP != "" && targetIP != savedIP) preferences.putString("target_ip", targetIP);
-
-      isStarted = true;
-      tft.fillScreen(TFT_BLACK);
-
-      if (selectedMode == 1) {
-        // SCREEN SEÇİLDİ -> NetworkTaskCode
-        xTaskCreatePinnedToCore(
-          NetworkTaskCode,
-          "NetTask",
-          8192,
-          NULL,
-          1,
-          &Task1,
-          0);  // Core 0
-      } else if (selectedMode == 2) {
-        // STREAM SEÇİLDİ -> NetworkTaskCode2
-        xTaskCreatePinnedToCore(
-          NetworkTaskCode2,
-          "NetTask2",
-          8192,
-          NULL,
-          1,
-          &Task1,
-          0);  // Core 0
-      }
-
-    } else {
-      // ============================================================
-      // 2.3: ÇİZİM DÖNGÜSÜ (CORE 1 - Consumer)
-      // ============================================================
-      JpgFrame currentFrame;
-
-      if (xQueueReceive(filledQueue, &currentFrame, 0) == pdPASS) {
-        if (jpeg.openRAM(currentFrame.buffer, currentFrame.len, JPEGDraw)) {
-          jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-          jpeg.decode(0, 0, 0);
-          jpeg.close();
-        }
-        xQueueSend(emptyQueue, &currentFrame.buffer, portMAX_DELAY);
-      }
-    }
-  }
-}
+import cv2
+import socket
+import struct
+import time
+import threading
+import os
+import mss
+import numpy as np
+import sys
+import subprocess
+import random  # <--- EKLENDİ: Rastgelelik için gerekli kütüphane
+
+# --- OPEN ON PC ---
+openonpc = True
+openonpc_delay = 1  # Dosya açıldıktan sonra pencerenin gelmesi için bekleme süresi
+
+# --- AYARLAR ---
+VIDEO_PATH = "medya"  # 'screen', '0', veya dosya yolu 0
+# 0 = kamera
+# 'screen' = ekran paylaşımı
+# 'video.mp4' = video dosyası
+# 'medya' = klasör (içindeki tüm geçerli medya dosyalarını
+PORT = 8080
+
+# --- PERFORMANS VE AKIŞ AYARLARI ---
+TARGET_FPS = 15
+FRAME_TIME = 1.0 / TARGET_FPS
+
+# --- SLAYT AYARLARI ---
+# klasör seçerseniz her resim için 5 saniye, videolar kendi sürelerine göre gösterilir
+SLIDE_INTERVAL = 5.0
+
+# --- GÖRÜNTÜ İŞLEME AYARLARI ---
+ENABLE_ROTATION = False
+ENABLE_FIT_AND_FILL = True
+
+# --- KALİTE AYARLARI ---
+VIDEO_JPEG_QUALITY = 90
+IMAGE_JPEG_QUALITY = 90
+
+# --- GLOBAL DEĞİŞKENLER ---
+global_frame = None
+lock = threading.Lock()
+
+
+def get_dominant_color(image):
+    small = cv2.resize(image, (1, 1), interpolation=cv2.INTER_AREA)
+    return small[0][0]
+
+
+def process_frame(frame):
+    if frame is None: return None
+    h, w = frame.shape[:2]
+
+    if ENABLE_ROTATION and h > w:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        h, w = frame.shape[:2]
+
+    target_w, target_h = 320, 240
+
+    if ENABLE_FIT_AND_FILL:
+        scale = min(target_w / w, target_h / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        resized_frame = cv2.resize(frame, (new_w, new_h))
+
+        avg_color = get_dominant_color(resized_frame)
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        canvas[:] = avg_color
+
+        x_offset = (target_w - new_w) // 2
+        y_offset = (target_h - new_h) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized_frame
+        return canvas
+    else:
+        return cv2.resize(frame, (target_w, target_h))
+
+
+def camera_thread_func():
+    global global_frame
+    src = int(VIDEO_PATH)
+    cap = cv2.VideoCapture(src)
+    if VIDEO_PATH.isdigit():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            with lock:
+                global_frame = frame
+        else:
+            cap.release()
+            time.sleep(1)
+            cap = cv2.VideoCapture(src)
+        time.sleep(0.01)
+
+
+def screen_thread_func():
+    global global_frame
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        while True:
+            img = np.array(sct.grab(monitor))
+            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            with lock: global_frame = frame
+            time.sleep(0.01)
+
+
+def get_files_in_directory(path):
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.mp4', '.avi', '.mov', '.mkv')
+    files = []
+    try:
+        for f in os.listdir(path):
+            if f.lower().endswith(valid_extensions):
+                files.append(os.path.join(path, f))
+        files.sort()  # Başlangıçta alfabetik sırala, aşağıda karıştıracağız
+    except Exception as e:
+        print(f"Klasör hatası: {e}")
+    return files
+
+
+# --- YARDIMCI FONKSİYON: DOSYA AÇMA (Düzeltilmiş - Non-Blocking) ---
+def open_media_on_pc(file_path):
+    """Belirtilen dosyayı işletim sisteminin varsayılan oynatıcısıyla açar (Arka Planda)."""
+    if not openonpc:
+        return
+
+    def _open_task():
+        try:
+            abs_path = os.path.abspath(file_path)
+            # print(f"Dosya PC'de açılıyor: {abs_path}") # Konsolu kirletmemesi için kapattım
+
+            if sys.platform == 'win32':
+                os.startfile(abs_path)
+            elif sys.platform == 'darwin':  # macOS
+                subprocess.call(('open', abs_path))
+            else:  # Linux
+                subprocess.call(('xdg-open', abs_path))
+
+            # Bekleme süresi artık sadece bu thread'i etkiler, veri akışını durdurmaz
+            time.sleep(openonpc_delay)
+        except Exception as e:
+            print(f"Dosya açma hatası: {e}")
+
+    # Dosya açma işlemini ayrı bir thread'de başlat
+    threading.Thread(target=_open_task, daemon=True).start()
+
+def start_server():
+    global global_frame
+    mode = "VIDEO"
+    slide_files = []
+
+    if VIDEO_PATH == "screen":
+        mode = "SCREEN"
+        threading.Thread(target=screen_thread_func, daemon=True).start()
+    elif VIDEO_PATH.isdigit():
+        mode = "CAMERA"
+        threading.Thread(target=camera_thread_func, daemon=True).start()
+    elif os.path.isdir(VIDEO_PATH):
+        mode = "SLIDE"
+        slide_files = get_files_in_directory(VIDEO_PATH)
+        if not slide_files: return
+
+        # --- RASGELE ÇALMA BAŞLANGICI ---
+        # İlk başta listeyi bir kere karıştıralım
+        print(f"Toplam dosya sayısı: {len(slide_files)}. Liste karıştırılıyor...")
+        random.shuffle(slide_files)
+        # --------------------------------
+
+    elif os.path.exists(VIDEO_PATH) and VIDEO_PATH.lower().endswith(('.jpg', '.png', '.jpeg')):
+        mode = "IMAGE"
+    elif os.path.exists(VIDEO_PATH):
+        mode = "VIDEO"
+    else:
+        print("Geçersiz VIDEO_PATH veya dosya bulunamadı.")
+        return
+
+    if mode in ["CAMERA", "SCREEN"]:
+        while global_frame is None: time.sleep(0.1)
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
+
+    try:
+        server_socket.bind(('0.0.0.0', PORT))
+        server_socket.listen(1)
+    except OSError:
+        print(f"Port {PORT} dolu.")
+        return
+
+    hostname = socket.gethostname()
+    print(f"Server: {socket.gethostbyname(hostname)}:{PORT} | Mod: {mode}")
+
+    static_data = None
+    if mode == "IMAGE":
+        open_media_on_pc(VIDEO_PATH)
+        img = process_frame(cv2.imread(VIDEO_PATH))
+        _, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), IMAGE_JPEG_QUALITY])
+        static_data = enc.tobytes()
+
+    while True:
+        print("\n--- ESP32 Bekleniyor ---")
+        client_socket, addr = server_socket.accept()
+        print(f"Bağlandı: {addr}")
+        client_socket.settimeout(None)
+
+        cap = None
+        source_fps = 30
+        start_time = time.time()
+        current_frame_num = 0
+        slide_index = 0
+        slide_loaded = False
+        slide_type = None
+        slide_start_time = 0
+        current_slide_img_data = None
+
+        if mode == "VIDEO":
+            open_media_on_pc(VIDEO_PATH)
+            cap = cv2.VideoCapture(VIDEO_PATH)
+            source_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            start_time = time.time()
+
+        try:
+            while True:
+                loop_start_time = time.time()
+                data_to_send = None
+
+                while data_to_send is None:
+                    if mode == "IMAGE":
+                        data_to_send = static_data
+
+                    elif mode in ["CAMERA", "SCREEN"]:
+                        with lock:
+                            if global_frame is not None:
+                                frm = process_frame(global_frame.copy())
+                                _, enc = cv2.imencode('.jpg', frm, [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY])
+                                data_to_send = enc.tobytes()
+                        if data_to_send is None: time.sleep(0.005)
+
+                    elif mode == "VIDEO":
+                        elapsed = time.time() - start_time
+                        target_frame = int(elapsed * source_fps)
+
+                        if target_frame >= total_frames:
+                            start_time = time.time()
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            current_frame_num = 0
+                            target_frame = 0
+                            open_media_on_pc(VIDEO_PATH)
+
+                        while current_frame_num < target_frame:
+                            cap.grab()
+                            current_frame_num += 1
+
+                        ret, frame = cap.read()
+                        if not ret:
+                            start_time = time.time()
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            current_frame_num = 0
+                            open_media_on_pc(VIDEO_PATH)
+                            continue
+
+                        current_frame_num += 1
+                        frame = process_frame(frame)
+                        _, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY])
+                        data_to_send = enc.tobytes()
+
+                    elif mode == "SLIDE":
+                        # Dosya yükleme kısmı
+                        if not slide_loaded:
+                            curr_file = slide_files[slide_index]
+                            open_media_on_pc(curr_file)
+
+                            ext = os.path.splitext(curr_file)[1].lower()
+                            if ext in ['.mp4', '.avi', '.mov', '.mkv']:
+                                slide_type = 'vid'
+                                if cap: cap.release()
+                                cap = cv2.VideoCapture(curr_file)
+                                source_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                                start_time = time.time()
+                                current_frame_num = 0
+                            else:
+                                slide_type = 'img'
+                                if cap: cap.release()
+                                cap = None
+                                img = cv2.imread(curr_file)
+                                if img is None:
+                                    # Dosya bozuksa bir sonraki dosyaya geç (Random mantığı burada da işlemeli)
+                                    slide_index += 1
+                                    if slide_index >= len(slide_files):
+                                        slide_index = 0
+                                        print("--- Liste bitti, yeniden karıştırılıyor ---")
+                                        random.shuffle(slide_files)
+                                    continue
+                                img = process_frame(img)
+                                _, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), IMAGE_JPEG_QUALITY])
+                                current_slide_img_data = enc.tobytes()
+                                slide_start_time = time.time()
+                            slide_loaded = True
+
+                        # Oynatma kısmı
+                        if slide_type == 'img':
+                            data_to_send = current_slide_img_data
+                            # Resim süresi doldu mu?
+                            if time.time() - slide_start_time > SLIDE_INTERVAL:
+                                slide_index += 1
+                                # Liste sonuna geldik mi?
+                                if slide_index >= len(slide_files):
+                                    slide_index = 0
+                                    print("--- Liste bitti, yeniden karıştırılıyor ---")
+                                    random.shuffle(slide_files)
+                                slide_loaded = False
+
+                        elif slide_type == 'vid':
+                            elapsed = time.time() - start_time
+                            target_frame = int(elapsed * source_fps)
+
+                            # Video bitti mi (frame sayısına göre)?
+                            if target_frame >= total_frames:
+                                slide_index += 1
+                                if slide_index >= len(slide_files):
+                                    slide_index = 0
+                                    print("--- Liste bitti, yeniden karıştırılıyor ---")
+                                    random.shuffle(slide_files)
+                                slide_loaded = False
+                                continue
+
+                            while current_frame_num < target_frame:
+                                cap.grab()
+                                current_frame_num += 1
+                            ret, frame = cap.read()
+
+                            # Video okuma hatası veya bitişi?
+                            if not ret:
+                                slide_index += 1
+                                if slide_index >= len(slide_files):
+                                    slide_index = 0
+                                    print("--- Liste bitti, yeniden karıştırılıyor ---")
+                                    random.shuffle(slide_files)
+                                slide_loaded = False
+                                continue
+
+                            current_frame_num += 1
+                            frame = process_frame(frame)
+                            _, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY])
+                            data_to_send = enc.tobytes()
+
+                # --- GÖNDERME ---
+                try:
+                    client_socket.sendall(struct.pack(">L", len(data_to_send)) + data_to_send)
+                except socket.error:
+                    print("Gönderme hatası, istemci koptu.")
+                    break
+
+                # --- FPS LİMİTLEME ---
+                process_duration = time.time() - loop_start_time
+                sleep_time = FRAME_TIME - process_duration
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except Exception as e:
+            print(f"Hata: {e}")
+        finally:
+            if client_socket: client_socket.close()
+            if cap: cap.release()
+
+
+if __name__ == "__main__":
+    start_server()
