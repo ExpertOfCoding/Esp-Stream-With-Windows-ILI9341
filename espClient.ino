@@ -1,22 +1,22 @@
 /*  
-    ESP32 Smooth Video Stream Client (Request-Response Mode)
-    
-    Gereklilikler:
-    - TFT_eSPI
-    - XPT2046_Touchscreen
-    - TJpg_Decoder
+    ESP32 Smooth Video Stream Client (Fixed: Watchdog Error & Optimized)
+    NOTES: NetworkTas 1 Works perfect
+    esp should stay close to wifi otherwise it seems laggy
+    screen stream optimised
 */
-// change buzzer freq gap
 
 #include <SPI.h>
+#include <FS.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
-#include <TJpg_Decoder.h>
+#include <JPEGDEC.h>
+#include <esp_task_wdt.h>  // Watchdog kütüphanesi eklendi
 
 TFT_eSPI tft = TFT_eSPI();
 Preferences preferences;
+JPEGDEC jpeg;
 
 // --- PIN TANIMLARI ---
 #define buzzerPin 26
@@ -40,20 +40,34 @@ XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 #define TS_MINY 240
 #define TS_MAXY 3800
 
-int pwmFreq = 2000;  // Ses frekansı
-int pwmRes = 8;      // Çözünürlük (8 bit)
+#define CLIENT_TIMEOUT 1500
+int pwmFreq = 2000;
+int pwmRes = 8;
 
 // --- GLOBAL DEĞİŞKENLER & BUFFER ---
 unsigned long timeDelay = 0;
 bool scan_wifi = true;
 bool isStarted = false;
 String targetIP = "";
-WiFiClient streamClient;
 
-// STATİK BUFFER: Sürekli hafıza oluştur/sil yapmamak için.
-#define MAX_JPG_SIZE 100000
-uint8_t* jpgBuffer = NULL;  // Sadece bir işaretçi (pointer) oluşturuyoruz, yer kaplamaz.
-// --- KLAVYE & NUMPAD DÜZENLERİ ---
+int selectedMode = 0;  // 0: Seçilmedi, 1: SCREEN, 2: STREAM
+
+// --- MULTI-THREADING YAPISI ---
+TaskHandle_t Task1;
+QueueHandle_t emptyQueue;
+QueueHandle_t filledQueue;
+
+struct JpgFrame {
+  uint8_t* buffer;
+  size_t len;
+};
+
+#define MAX_JPG_SIZE 50000
+
+uint8_t* bufA;
+uint8_t* bufB;
+
+// --- KLAVYE & NUMPAD ---
 const char mobile_keyboard[4][11] = {
   { '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 0 },
   { 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', 0 },
@@ -69,7 +83,6 @@ const char numpad_keys[4][3] = {
 };
 
 // --- YARDIMCI FONKSİYONLAR ---
-
 String ssidToKey(String ssid) {
   unsigned long hash = 5381;
   for (int i = 0; i < ssid.length(); i++) {
@@ -79,28 +92,21 @@ String ssidToKey(String ssid) {
 }
 
 void typeWriterPrint(String text, int centerX, int y, int fontIndex) {
-  // Bu fonksiyon her çağrıldığında 1 ile 255 arasında RASTGELE bir güç belirle
   int randomDuty = random(1, 256);
-
-  // --- Konum Hesaplama (DrawCentre Mantığı) ---
   tft.setTextFont(fontIndex);
-  int textWidth = tft.textWidth(text);     // Metnin piksel genişliği
-  int startX = centerX - (textWidth / 2);  // Başlangıç noktası
-  tft.setCursor(startX, y);                // İmleci konumlandır
+  int textWidth = tft.textWidth(text);
+  int startX = centerX - (textWidth / 2);
+  tft.setCursor(startX, y);
 
-  // --- Yazdırma Döngüsü ---
   for (int i = 0; i < text.length(); i++) {
-    tft.print(text[i]);  // Harfi bas
-
-    // Rastgele belirlenen güçle sesi aç
-    // ESP32 v3.0'da ledcWrite artık KANAL değil PIN numarası ister.
+    tft.print(text[i]);
     ledcWrite(buzzerPin, randomDuty);
-    delay(10);                // Ses süresi
-    ledcWrite(buzzerPin, 0);  // Sesi kapat
-
-    delay(35);  // Harf arası bekleme
+    delay(10);
+    ledcWrite(buzzerPin, 0);
+    delay(35);
   }
 }
+
 void printWifiInfo(String ssid, String rssi, String encryption) {
   tft.fillScreen(TFT_WHITE);
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -115,15 +121,12 @@ void printWifiInfo(String ssid, String rssi, String encryption) {
   typeWriterPrint(encryption, centerX, 140, 2);
 }
 
-// TJpg_Decoder Callback (Ekrana Çizim)
-bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  if (y >= SCREEN_HEIGHT) return 0;
-  tft.pushImage(x, y, w, h, bitmap);
+int JPEGDraw(JPEGDRAW* pDraw) {
+  tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
   return 1;
 }
 
 // --- ARAYÜZ FONKSİYONLARI ---
-
 void drawKeyboard(bool isShift) {
   int keyW = 32;
   int keyH = 40;
@@ -198,25 +201,15 @@ String getPasswordFromKeyboard(String ssidName, String savedPassword) {
         int c = touch_x / keyW;
         if (r >= 0 && r < 4 && c >= 0 && c < 10) {
           ledcWrite(buzzerPin, 128);
-          delay(10);                // Ses süresi
-          ledcWrite(buzzerPin, 0);  // Sesi kapat
+          delay(10);
+          ledcWrite(buzzerPin, 0);
           if (r == 2 && c == 9) {
             if (pass.length() > 0) pass.remove(pass.length() - 1);
           } else if (r == 3 && c == 9) {
             finish = true;
             ledcWrite(buzzerPin, 255);
-            delay(20);                  // Ses süresi
-            ledcWrite(buzzerPin, 230);  // Sesi kapat
-            delay(20);                  // Ses süresi
-            ledcWrite(buzzerPin, 200);
-            delay(20);                  // Ses süresi
-            ledcWrite(buzzerPin, 190);  // Sesi kapat
-            delay(20);                  // Ses süresi
-            ledcWrite(buzzerPin, 150);  // Sesi kapat
-            delay(20);                  // Ses süresi
-            ledcWrite(buzzerPin, 130);
-            delay(20);                // Ses süresi
-            ledcWrite(buzzerPin, 0);  // Sesi kapat
+            delay(20);
+            ledcWrite(buzzerPin, 0);
           } else if (r == 3 && c == 0) {
             isShift = !isShift;
             drawKeyboard(isShift);
@@ -301,8 +294,8 @@ String getIPPortFromNumpad(String savedIP) {
         ;
       if (t_x >= startX && t_x < ctrlX && t_y >= startY && t_y < startY + totalH) {
         ledcWrite(buzzerPin, 128);
-        delay(10);                // Ses süresi
-        ledcWrite(buzzerPin, 0);  // Sesi kapat
+        delay(10);
+        ledcWrite(buzzerPin, 0);
         int r = (t_y - startY) / btnH;
         int c = (t_x - startX) / btnW;
         if (r >= 0 && r < 4 && c >= 0 && c < 3) {
@@ -314,26 +307,16 @@ String getIPPortFromNumpad(String savedIP) {
         if (t_y >= startY && t_y < startY + (totalH / 2)) {
           if (currentInput.length() > 0) {
             ledcWrite(buzzerPin, 255);
-            delay(10);                // Ses süresi
-            ledcWrite(buzzerPin, 0);  // Sesi kapat
+            delay(10);
+            ledcWrite(buzzerPin, 0);
             currentInput.remove(currentInput.length() - 1);
             updateScreen = true;
           }
         } else if (t_y >= startY + (totalH / 2) && t_y < startY + totalH) {
           finished = true;
           ledcWrite(buzzerPin, 255);
-          delay(20);                  // Ses süresi
-          ledcWrite(buzzerPin, 230);  // Sesi kapat
-          delay(20);                  // Ses süresi
-          ledcWrite(buzzerPin, 200);
-          delay(20);                  // Ses süresi
-          ledcWrite(buzzerPin, 190);  // Sesi kapat
-          delay(20);                  // Ses süresi
-          ledcWrite(buzzerPin, 150);  // Sesi kapat
-          delay(20);                  // Ses süresi
-          ledcWrite(buzzerPin, 130);
-          delay(20);                // Ses süresi
-          ledcWrite(buzzerPin, 0);  // Sesi kapat
+          delay(20);
+          ledcWrite(buzzerPin, 0);
         }
       }
     }
@@ -341,18 +324,217 @@ String getIPPortFromNumpad(String savedIP) {
   return currentInput;
 }
 
+void drawModeButtons() {
+  tft.fillScreen(TFT_BLACK);
+
+  // Başlık
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("MOD SECIMI", SCREEN_WIDTH / 2, 20, 2);
+
+  // SCREEN Butonu (Sol - Mavi)
+  tft.fillRect(20, 70, 130, 100, TFT_BLUE);
+  tft.drawRect(20, 70, 130, 100, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.drawCentreString("SCREEN", 85, 110, 2);
+
+  // STREAM Butonu (Sağ - Turuncu)
+  tft.fillRect(170, 70, 130, 100, TFT_ORANGE);
+  tft.drawRect(170, 70, 130, 100, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_ORANGE);
+  tft.drawCentreString("STREAM", 235, 110, 2);
+}
+
+
+void NetworkTaskCode2(void* parameter) {
+  WiFiClient localClient;
+  String ipStr;
+  int port;
+  int colonIndex = targetIP.indexOf(':');
+  ipStr = targetIP.substring(0, colonIndex);
+  port = targetIP.substring(colonIndex + 1).toInt();
+  while (true) {
+    if (!localClient.connected()) {
+      if (!localClient.connect(ipStr.c_str(), port)) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        continue;
+      }
+      localClient.setNoDelay(true);
+    }
+    if (localClient.available() < 4) {
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    uint8_t sizeBuffer[4];
+    if (localClient.readBytes(sizeBuffer, 4) != 4) continue;
+    uint32_t jpgSize = (sizeBuffer[0] << 24) | (sizeBuffer[1] << 16) | (sizeBuffer[2] << 8) | sizeBuffer[3];
+
+    if (jpgSize > MAX_JPG_SIZE || jpgSize == 0) {
+      while (localClient.available()) localClient.read();
+      localClient.stop();
+      continue;
+    }
+
+    uint8_t* ptr = NULL;
+    if (xQueueReceive(emptyQueue, &ptr, portMAX_DELAY) == pdPASS) {
+
+      size_t readLen = 0;
+      unsigned long startRead = millis();
+      bool error = false;
+
+      while (readLen < jpgSize) {
+        if (localClient.available()) {
+          int r = localClient.read(ptr + readLen, jpgSize - readLen);
+          if (r > 0) {
+            readLen += r;
+            startRead = millis();
+          }
+        }
+        if (millis() - startRead > CLIENT_TIMEOUT) {
+          localClient.stop();
+          error = true;
+          break;
+        }
+      }
+
+      if (!error) {
+        JpgFrame frame;
+        frame.buffer = ptr;
+        frame.len = jpgSize;
+        xQueueSend(filledQueue, &frame, portMAX_DELAY);
+      } else {
+        xQueueSend(emptyQueue, &ptr, portMAX_DELAY);
+      }
+    }
+  }
+}
+
+// ====================================================================================
+// PERFORMANS ODAKLI NETWORK GÖREVİ (Smart Yielding)
+// ====================================================================================
+void NetworkTaskCode(void* parameter) {
+  WiFiClient localClient;
+  String ipStr;
+  int port;
+
+  int colonIndex = targetIP.indexOf(':');
+  ipStr = targetIP.substring(0, colonIndex);
+  port = targetIP.substring(colonIndex + 1).toInt();
+
+  // Watchdog için zaman sayacı
+  unsigned long lastYieldTime = 0;
+
+  while (true) {
+    if (!localClient.connected()) {
+      if (!localClient.connect(ipStr.c_str(), port)) {
+        // Bağlı değilken beklemesinde sakınca yok
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        continue;
+      }
+      localClient.setNoDelay(true);
+    }
+
+    // --- KRİTİK NOKTA 1: VERİ BEKLEME ---
+    // Eğer hiç veri yoksa işlemciyi yorma, 1ms bekle.
+    // Bu sadece akış kesildiğinde devreye girer, akış varken çalışmaz.
+    if (localClient.available() < 4) {
+      // Sadece çok uzun süre veri gelmezse bekle (Smart Yield)
+      if (millis() - lastYieldTime > 10) {
+        vTaskDelay(1);
+        lastYieldTime = millis();
+      }
+      continue;
+    }
+
+    uint8_t sizeBuffer[4];
+    if (localClient.readBytes(sizeBuffer, 4) != 4) continue;
+    uint32_t jpgSize = (sizeBuffer[0] << 24) | (sizeBuffer[1] << 16) | (sizeBuffer[2] << 8) | sizeBuffer[3];
+
+    if (jpgSize > MAX_JPG_SIZE || jpgSize == 0) {
+      while (localClient.available()) localClient.read();
+      localClient.stop();
+      continue;
+    }
+
+    uint8_t* ptr = NULL;
+    if (xQueueReceive(emptyQueue, &ptr, portMAX_DELAY) == pdPASS) {
+
+      size_t readLen = 0;
+      unsigned long startRead = millis();
+      bool error = false;
+
+      while (readLen < jpgSize) {
+        int avail = localClient.available();
+
+        if (avail > 0) {
+          int bytesToRead = jpgSize - readLen;
+          if (bytesToRead > avail) bytesToRead = avail;
+
+          // Veriyi son sürat oku
+          int r = localClient.read(ptr + readLen, bytesToRead);
+          if (r > 0) {
+            readLen += r;
+            startRead = millis();
+          }
+        }
+
+        // --- KRİTİK NOKTA 2: SMART YIELD ---
+        // Her seferinde değil, sadece 20ms'de bir 1ms mola ver.
+        // Bu, Watchdog'u (5 saniye süresi var) resetlemek için fazlasıyla yeterli
+        // ama görüntüyü dondurmayacak kadar kısadır.
+        if (millis() - lastYieldTime > 20) {
+          vTaskDelay(1);  // İşletim sistemine "Ben buradayım" de
+          lastYieldTime = millis();
+        }
+
+        // Timeout kontrolü
+        if (millis() - startRead > CLIENT_TIMEOUT) {
+          localClient.stop();
+          error = true;
+          break;
+        }
+      }
+
+      if (!error) {
+        JpgFrame frame;
+        frame.buffer = ptr;
+        frame.len = jpgSize;
+        xQueueSend(filledQueue, &frame, portMAX_DELAY);
+      } else {
+        xQueueSend(emptyQueue, &ptr, portMAX_DELAY);
+      }
+    }
+  }
+}
 // -------------------------------------------------------------------------
 // SETUP
 // -------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  // --- BELLEK AYIRMA ---
-  // 75KB'lık alanı Heap'ten ayırıyoruz
-  jpgBuffer = (uint8_t*)malloc(MAX_JPG_SIZE);
-  // Buzzer pinini LEDC kanalına bağla (Bu ayarı normalde setup'ta yapmak daha iyidir
-  // ama fonksiyonun tek başına çalışması için buraya ekledim)
   ledcAttach(buzzerPin, pwmFreq, pwmRes);
+
   preferences.begin("wifi_db", false);
+
+  if (psramFound()) {
+    Serial.println("PSRAM bulundu, buffer PSRAM'e kuruluyor...");
+    bufA = (uint8_t*)ps_malloc(MAX_JPG_SIZE);
+    bufB = (uint8_t*)ps_malloc(MAX_JPG_SIZE);
+  } else {
+    Serial.println("PSRAM yok, standart RAM kullaniliyor...");
+    bufA = (uint8_t*)malloc(MAX_JPG_SIZE);
+    bufB = (uint8_t*)malloc(MAX_JPG_SIZE);
+  }
+
+  if (bufA == NULL || bufB == NULL) {
+    Serial.printf("Yetersiz bellek! Gereken: %d byte. Mevcut Free Heap: %d\n", MAX_JPG_SIZE * 2, ESP.getFreeHeap());
+    while (1) { delay(1000); }
+  }
+
+  emptyQueue = xQueueCreate(2, sizeof(uint8_t*));
+  filledQueue = xQueueCreate(2, sizeof(JpgFrame));
+
+  xQueueSend(emptyQueue, &bufA, portMAX_DELAY);
+  xQueueSend(emptyQueue, &bufB, portMAX_DELAY);
 
   touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   touchscreen.begin(touchscreenSPI);
@@ -361,11 +543,9 @@ void setup() {
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_WHITE);
+  tft.setSwapBytes(true);
+  tft.initDMA();
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
-
-  TJpgDec.setJpgScale(1);
-  TJpgDec.setSwapBytes(true);
-  TJpgDec.setCallback(tft_output);
 
   int centerX = SCREEN_WIDTH / 2;
   typeWriterPrint("Sistem Baslatiliyor...", centerX, 100, FONT_SIZE);
@@ -376,10 +556,10 @@ void setup() {
 }
 
 // -------------------------------------------------------------------------
-// LOOP
+// LOOP (MAIN THREAD - CORE 1: EKRAN ÇİZİM)
 // -------------------------------------------------------------------------
 void loop() {
-  // AŞAMA 1: Wİ-Fİ BAĞLANTISI
+  // AŞAMA 1: Wİ-Fİ AYARLARI (Arayüz)
   if (scan_wifi) {
     scan_wifi = false;
     tft.fillScreen(TFT_WHITE);
@@ -445,89 +625,88 @@ void loop() {
     }
   }
 
-  // AŞAMA 2: BAĞLANTI SONRASI
+  // AŞAMA 2: BAĞLANTI SONRASI & STREAM BAŞLATMA
   if (WiFi.status() == WL_CONNECTED) {
-    if (!isStarted) {
+
+    // 2.1: MOD SEÇİMİ (HENÜZ SEÇİLMEDİYSE)
+    if (selectedMode == 0) {
+      drawModeButtons();
+      bool modeSelected = false;
+      while (!modeSelected) {
+        if (touchscreen.tirqTouched() && touchscreen.touched()) {
+          TS_Point p = touchscreen.getPoint();
+          int t_x = map(p.x, TS_MINX, TS_MAXX, 0, SCREEN_WIDTH);
+          int t_y = map(p.y, TS_MINY, TS_MAXY, 0, SCREEN_HEIGHT);
+
+          delay(150);  // Debounce
+          while (touchscreen.touched())
+            ;  // Parmağın çekilmesini bekle
+
+          // SCREEN Butonu Koordinatları (20,70) - (150, 170)
+          if (t_x >= 20 && t_x <= 150 && t_y >= 70 && t_y <= 170) {
+            selectedMode = 1;  // SCREEN
+            ledcWrite(buzzerPin, 200);
+            delay(50);
+            ledcWrite(buzzerPin, 0);
+            modeSelected = true;
+          }
+          // STREAM Butonu Koordinatları (170,70) - (300, 170)
+          else if (t_x >= 170 && t_x <= 300 && t_y >= 70 && t_y <= 170) {
+            selectedMode = 2;  // STREAM
+            ledcWrite(buzzerPin, 200);
+            delay(50);
+            ledcWrite(buzzerPin, 0);
+            modeSelected = true;
+          }
+        }
+      }
+    }
+
+    // 2.2: IP GİRİŞİ VE GÖREV BAŞLATMA
+    else if (!isStarted) {
       String savedIP = preferences.getString("target_ip", "");
       targetIP = getIPPortFromNumpad(savedIP);
       if (targetIP != "" && targetIP != savedIP) preferences.putString("target_ip", targetIP);
+
       isStarted = true;
       tft.fillScreen(TFT_BLACK);
-    }else {
+
+      if (selectedMode == 1) {
+        // SCREEN SEÇİLDİ -> NetworkTaskCode
+        xTaskCreatePinnedToCore(
+          NetworkTaskCode,
+          "NetTask",
+          8192,
+          NULL,
+          1,
+          &Task1,
+          0);  // Core 0
+      } else if (selectedMode == 2) {
+        // STREAM SEÇİLDİ -> NetworkTaskCode2
+        xTaskCreatePinnedToCore(
+          NetworkTaskCode2,
+          "NetTask2",
+          8192,
+          NULL,
+          1,
+          &Task1,
+          0);  // Core 0
+      }
+
+    } else {
       // ============================================================
-      // SÜREKLİ AKIŞ MODU (CONTINUOUS STREAM - RECEIVER)
+      // 2.3: ÇİZİM DÖNGÜSÜ (CORE 1 - Consumer)
       // ============================================================
+      JpgFrame currentFrame;
 
-      if (!streamClient.connected()) {
-        int colonIndex = targetIP.indexOf(':');
-        String ipStr = targetIP.substring(0, colonIndex);
-        int port = targetIP.substring(colonIndex + 1).toInt();
-
-        if (!streamClient.connect(ipStr.c_str(), port)) {
-          delay(100);
-          return;
+      if (xQueueReceive(filledQueue, &currentFrame, 0) == pdPASS) {
+        if (jpeg.openRAM(currentFrame.buffer, currentFrame.len, JPEGDraw)) {
+          jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+          jpeg.decode(0, 0, 0);
+          jpeg.close();
         }
-        // Nagle algoritmasını kapatır (Daha düşük gecikme sağlar)
-        streamClient.setNoDelay(true);
+        xQueueSend(emptyQueue, &currentFrame.buffer, portMAX_DELAY);
       }
-
-      // 1. HEADER KONTROLÜ (4 Byte gelmiş mi?)
-      // Python sürekli veri gönderiyor. Eğer buffer boşsa, 
-      // işlemciyi bloklamadan loop'un başına dönüyoruz.
-      if (streamClient.available() < 4) {
-        return; 
-      }
-
-      // 2. BOYUTU OKU
-      uint8_t sizeBuffer[4];
-      // readBytes, 4 byte gelene kadar bekler (varsayılan timeout süresince)
-      if (streamClient.readBytes(sizeBuffer, 4) != 4) {
-         return; // Eksik okuma olursa çık
-      }
-      
-      uint32_t jpgSize = (sizeBuffer[0] << 24) | (sizeBuffer[1] << 16) | (sizeBuffer[2] << 8) | sizeBuffer[3];
-
-      // 3. GÜVENLİK KONTROLÜ
-      // Eğer gelen paket boyutu bufferımızdan büyükse veya 0 ise hata var demektir.
-      if (jpgSize > MAX_JPG_SIZE || jpgSize == 0) {
-        Serial.printf("Hatali Paket Boyutu: %u\n", jpgSize);
-        // Senkronizasyon bozulmuş olabilir, buffer'ı temizle
-        while (streamClient.available()) streamClient.read();
-        streamClient.stop(); // Bağlantıyı yenilemek en güvenlisidir
-        return;
-      }
-
-      // 4. RESİM VERİSİNİ OKU
-      // Header'ı okuduk, şimdi gövdenin tamamının gelmesini bekleyeceğiz.
-      // Burada timeout mekanizması kullanıyoruz.
-      unsigned long startRead = millis();
-      size_t readLen = 0;
-      
-      while (readLen < jpgSize) {
-        // Veri varsa oku
-        if (streamClient.available()) {
-          int r = streamClient.read(jpgBuffer + readLen, jpgSize - readLen);
-          if (r > 0) {
-            readLen += r;
-            startRead = millis(); // Her veri geldiğinde zamanlayıcıyı sıfırla
-          }
-        }
-        
-        // Timeout Kontrolü (1 saniye içinde paket tamamlanmazsa)
-        if (millis() - startRead > 1000) {
-          Serial.println("Timeout: Resim verisi yarim kaldi.");
-          streamClient.stop();
-          return;
-        }
-      }
-
-      // 5. ÇİZ (TJpg_Decoder)
-      // Veri tamamsa çizdiriyoruz.
-      TJpgDec.drawJpg(0, 0, jpgBuffer, jpgSize);
-      
-      // FPS Hesabı (Serial Plotter için)
-      Serial.println(millis() - timeDelay);
-      timeDelay = millis();
     }
   }
 }
